@@ -49,6 +49,12 @@ For example:
 python main.py ./pdfs_to_compress -o ./compressed -d 150 -p a4
 ```
 
+### Handling Large Files
+
+Large PDFs may require more time to compress. To avoid interruptions, disable the
+timeout with `-t 0` so Ghostscript can run without a limit. The program will
+automatically move on to the next file if an error occurs.
+
 ### Build an Executable
 
 If you need a standalone executable, install PyInstaller and build:
