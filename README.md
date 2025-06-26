@@ -1,111 +1,66 @@
-# 📄 PaperLite
+# PaperLite
 
-**PaperLite** is a lightweight desktop tool for batch processing and compressing PDF files using [Ghostscript](https://www.ghostscript.com/). It provides both a user-friendly graphical interface and a flexible command-line interface (CLI), allowing users to convert PDFs to grayscale, optimize file size, and standardize page dimensions with ease.
+PaperLite is a lightweight tool for compressing and standardising PDF files using Ghostscript. It includes a minimal Tkinter GUI and a command‑line interface.
 
----
+## Features
 
-## ✨ Features
+- Batch processing of PDF files
+- Optional grayscale conversion
+- Standardised page sizes (A4, Letter, Legal, A3)
+- DPI control for adjusting quality
+- Automatic creation of an output folder
 
-- ✅ Batch compress and convert multiple PDF files
-- 🎨 Convert PDFs to grayscale for reduced file size
-- 📄 Standardize paper size (A4, Letter, Legal, A3)
-- ⚙️ Adjustable DPI settings for quality control
-- 🖥️ Simple and intuitive GUI built with Tkinter
-- 💻 Command-line support for automation
-- 📁 Automatic output folder creation
-- 🧩 Ghostscript integration (auto-detected)
+## Requirements
 
----
+- Python 3.8+
+- [Ghostscript](https://www.ghostscript.com/) available on your PATH
+- `psutil` (optional, used for additional system information)
 
-## 🖥️ GUI Preview
+## Installation
 
-![GUI Screenshot](screenshots/gui_sample.png) <!-- Replace with actual screenshot -->
-
----
-
-## 🚀 Getting Started
-
-### 📦 Requirements
-
-- Python 3.8 or later
-- [Ghostscript](https://www.ghostscript.com/download/gsdnld.html) (must be installed and added to your system's PATH)
-
-### 📥 Installation
+Clone the repository and install the optional dependency:
 
 ```bash
 git clone https://github.com/yourusername/paperlite.git
 cd paperlite
-pip install -r requirements.txt
-````
+pip install psutil
+```
 
----
+## Usage
 
-### ▶️ Run the Application
-
-#### GUI Mode:
+### GUI
 
 ```bash
 python main.py
 ```
 
-#### CLI Mode:
+### Command Line
 
 ```bash
-python main.py <input_file_or_folder> [options]
+python main.py <input_path> [-o OUTPUT] [-d DPI] [-p {a4,letter,legal,a3}] [-t TIMEOUT]
 ```
 
-**Example:**
+For example:
 
 ```bash
 python main.py ./pdfs_to_compress -o ./compressed -d 150 -p a4
 ```
 
----
+### Build an Executable
 
-### 🛠️ CLI Options
-
-| Option           | Description                                | Default      |
-| ---------------- | ------------------------------------------ | ------------ |
-| `-o`, `--output` | Output folder for processed PDFs           | `compressed` |
-| `-d`, `--dpi`    | DPI for rendering and compression          | `200`        |
-| `-p`, `--paper`  | Paper size (`a4`, `letter`, `legal`, `a3`) | `a4`         |
-| `-t`, `--timeout`| Ghostscript timeout in seconds             | `600`        |
-
----
-
-## 🧊 Build Standalone Executable (with PyInstaller)
-
-To generate a **single `.exe` file** for easy distribution (with no console window):
-
-### 1. Install PyInstaller
+If you need a standalone executable, install PyInstaller and build:
 
 ```bash
 pip install pyinstaller
-```
-
-### 2. Build the Executable
-
-```bash
 pyinstaller --onefile --windowed main.py
 ```
 
-> ✅ `--onefile`: bundles everything into a single `.exe`
-> ✅ `--windowed`: prevents a console window from opening when running the GUI (Windows only)
+The resulting binary will be located in `dist/`.
 
-The output `.exe` file will be located in the `dist/` folder.
+## License
 
----
+This project is released under the MIT License.
 
-## 📄 License
+## Acknowledgements
 
-This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for details.
-
----
-
-## 🙌 Acknowledgments
-
-* Built with ❤️ using Python and Ghostscript
-* Thanks to the open-source community behind PyInstaller, Tkinter, and cx\_Freeze
-* Special thanks to users who contributed ideas and feedback
-
----
+Built with Python and Ghostscript.
