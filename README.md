@@ -33,12 +33,15 @@ pip install psutil
 ```bash
 python main.py
 ```
+The GUI now includes a field to set the Ghostscript timeout (in seconds).
 
 ### Command Line
 
 ```bash
 python main.py <input_path> [-o OUTPUT] [-d DPI] [-p {a4,letter,legal,a3}] [-t TIMEOUT]
 ```
+`TIMEOUT` controls how long Ghostscript is allowed to run. Set to `0` to disable
+the timeout entirely. The default is `1200` seconds.
 
 For example:
 
