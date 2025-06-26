@@ -68,10 +68,11 @@ def resource_path(relative_path):
 class PDFProcessor:
     """Main PDF processing class using Ghostscript."""
 
-    def __init__(self, dpi: int = 200, paper_size: str = "a4", timeout: int = 600):
+    def __init__(self, dpi: int = 200, paper_size: str = "a4", timeout: int = 1200):
         self.logger = logging.getLogger('PDFProcessor.Core')
         self.dpi = dpi
         self.paper_size = paper_size.lower()
+        # Allow 0 or negative values to disable the timeout entirely
         self.timeout = timeout
 
         self.logger.info(
@@ -235,11 +236,12 @@ class PDFProcessor:
             
             # Execute Ghostscript command
             self.logger.debug("Executing Ghostscript command")
+            proc_timeout = self.timeout if self.timeout and self.timeout > 0 else None
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=self.timeout,
+                timeout=proc_timeout,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
             
@@ -518,7 +520,13 @@ class PDFProcessorGUI:
         ttk.Label(config_frame, text="Paper Size:").grid(row=0, column=2, sticky=tk.W)
         self.paper_var = tk.StringVar(value="a4")
         paper_combo = ttk.Combobox(config_frame, textvariable=self.paper_var, values=["a4", "letter", "legal", "a3"], width=10, state="readonly")
-        paper_combo.grid(row=0, column=3, sticky=tk.W, padx=(5, 0))
+        paper_combo.grid(row=0, column=3, sticky=tk.W, padx=(5, 20))
+
+        # Timeout setting
+        ttk.Label(config_frame, text="Timeout (s):").grid(row=0, column=4, sticky=tk.W)
+        self.timeout_var = tk.StringVar(value="1200")
+        timeout_entry = ttk.Entry(config_frame, textvariable=self.timeout_var, width=10)
+        timeout_entry.grid(row=0, column=5, sticky=tk.W, padx=(5, 0))
         
         # File selection frame
         file_frame = ttk.LabelFrame(main_frame, text="File Selection", padding="10")
@@ -670,7 +678,8 @@ class PDFProcessorGUI:
             # Test Ghostscript availability
             dpi = int(self.dpi_var.get())
             paper_size = self.paper_var.get()
-            test_processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=600)
+            timeout = int(self.timeout_var.get())
+            test_processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=timeout)
             
         except Exception as e:
             messagebox.showerror("Ghostscript Error", str(e))
@@ -691,8 +700,9 @@ class PDFProcessorGUI:
         try:
             dpi = int(self.dpi_var.get())
             paper_size = self.paper_var.get()
-            
-            self.processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=600)
+            timeout = int(self.timeout_var.get())
+
+            self.processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=timeout)
             
             successful, failed = self.processor.process_batch(
                 self.input_paths,
@@ -753,7 +763,8 @@ def cli_interface():
     parser.add_argument("-d", "--dpi", type=int, default=200, help="Output DPI (default: 200)")
     parser.add_argument("-p", "--paper", default="a4", choices=["a4", "letter", "legal", "a3"],
                        help="Paper size (default: a4)")
-    parser.add_argument("-t", "--timeout", type=int, default=600, help="Ghostscript timeout in seconds (default: 600)")
+    parser.add_argument("-t", "--timeout", type=int, default=1200,
+                        help="Ghostscript timeout in seconds (0 for no timeout, default: 1200)")
     
     args = parser.parse_args()
     
@@ -780,7 +791,8 @@ def cli_interface():
     print(f"PDF Batch Processor v1.0")
     print(f"Found {len(input_paths)} PDF file(s)")
     print(f"Output folder: {output_dir}")
-    print(f"Settings: DPI={args.dpi}, Paper={args.paper}, Timeout={args.timeout}s")
+    timeout_display = f"{args.timeout}s" if args.timeout and args.timeout > 0 else "no limit"
+    print(f"Settings: DPI={args.dpi}, Paper={args.paper}, Timeout={timeout_display}")
     print("-" * 50)
     
     # Process files
