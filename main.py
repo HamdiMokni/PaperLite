@@ -67,13 +67,16 @@ def resource_path(relative_path):
 
 class PDFProcessor:
     """Main PDF processing class using Ghostscript."""
-    
-    def __init__(self, dpi: int = 200, paper_size: str = "a4"):
+
+    def __init__(self, dpi: int = 200, paper_size: str = "a4", timeout: int = 600):
         self.logger = logging.getLogger('PDFProcessor.Core')
         self.dpi = dpi
         self.paper_size = paper_size.lower()
-        
-        self.logger.info(f"Initializing PDFProcessor with DPI={dpi}, paper_size={paper_size}")
+        self.timeout = timeout
+
+        self.logger.info(
+            f"Initializing PDFProcessor with DPI={dpi}, paper_size={paper_size}, timeout={timeout}s"
+        )
         
         # Paper size mappings (width x height in points, 72 points = 1 inch)
         self.paper_sizes = {
@@ -233,10 +236,10 @@ class PDFProcessor:
             # Execute Ghostscript command
             self.logger.debug("Executing Ghostscript command")
             result = subprocess.run(
-                cmd, 
-                capture_output=True, 
-                text=True, 
-                timeout=300,  # 5 minute timeout
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.timeout,
                 creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
             )
             
@@ -299,7 +302,7 @@ class PDFProcessor:
                 return False
                 
         except subprocess.TimeoutExpired:
-            error_msg = f"Processing timeout after 5 minutes"
+            error_msg = f"Processing timeout after {self.timeout} seconds"
             self.logger.error(f"✗ Timeout: {input_path.name} - {error_msg}")
             self.stats['errors'].append({
                 'file': str(input_path),
@@ -667,7 +670,7 @@ class PDFProcessorGUI:
             # Test Ghostscript availability
             dpi = int(self.dpi_var.get())
             paper_size = self.paper_var.get()
-            test_processor = PDFProcessor(dpi=dpi, paper_size=paper_size)
+            test_processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=600)
             
         except Exception as e:
             messagebox.showerror("Ghostscript Error", str(e))
@@ -689,7 +692,7 @@ class PDFProcessorGUI:
             dpi = int(self.dpi_var.get())
             paper_size = self.paper_var.get()
             
-            self.processor = PDFProcessor(dpi=dpi, paper_size=paper_size)
+            self.processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=600)
             
             successful, failed = self.processor.process_batch(
                 self.input_paths,
@@ -750,6 +753,7 @@ def cli_interface():
     parser.add_argument("-d", "--dpi", type=int, default=200, help="Output DPI (default: 200)")
     parser.add_argument("-p", "--paper", default="a4", choices=["a4", "letter", "legal", "a3"],
                        help="Paper size (default: a4)")
+    parser.add_argument("-t", "--timeout", type=int, default=600, help="Ghostscript timeout in seconds (default: 600)")
     
     args = parser.parse_args()
     
@@ -776,12 +780,12 @@ def cli_interface():
     print(f"PDF Batch Processor v1.0")
     print(f"Found {len(input_paths)} PDF file(s)")
     print(f"Output folder: {output_dir}")
-    print(f"Settings: DPI={args.dpi}, Paper={args.paper}")
+    print(f"Settings: DPI={args.dpi}, Paper={args.paper}, Timeout={args.timeout}s")
     print("-" * 50)
     
     # Process files
     try:
-        processor = PDFProcessor(dpi=args.dpi, paper_size=args.paper)
+        processor = PDFProcessor(dpi=args.dpi, paper_size=args.paper, timeout=args.timeout)
         
         def progress_callback(message):
             print(message)
@@ -802,6 +806,8 @@ def cli_interface():
 
 def main():
     """Main entry point."""
+    main_logger, _, _, _ = setup_logging()
+    main_logger.info("Application starting")
     # Set up exception handling for GUI mode
     def handle_exception(exc_type, exc_value, exc_traceback):
         if issubclass(exc_type, KeyboardInterrupt):
@@ -819,9 +825,11 @@ def main():
     
     if len(sys.argv) > 1:
         # CLI mode
+        main_logger.info("Running in CLI mode")
         sys.exit(cli_interface())
     else:
         # GUI mode
+        main_logger.info("Running in GUI mode")
         try:
             app = PDFProcessorGUI()
             app.run()

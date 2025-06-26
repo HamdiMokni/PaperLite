@@ -69,6 +69,7 @@ python main.py ./pdfs_to_compress -o ./compressed -d 150 -p a4
 | `-o`, `--output` | Output folder for processed PDFs           | `compressed` |
 | `-d`, `--dpi`    | DPI for rendering and compression          | `200`        |
 | `-p`, `--paper`  | Paper size (`a4`, `letter`, `legal`, `a3`) | `a4`         |
+| `-t`, `--timeout`| Ghostscript timeout in seconds             | `600`        |
 
 ---
 
