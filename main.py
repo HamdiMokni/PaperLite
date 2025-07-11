@@ -127,6 +127,35 @@ class PerformanceTracker:
 # Global performance tracker
 perf_tracker = PerformanceTracker()
 
+def get_file_size(file_path):
+    """Get file size in MB"""
+    try:
+        return os.path.getsize(file_path) / (1024 * 1024)
+    except:
+        return 0
+
+def calculate_timeout(file_path):
+    """Calculate appropriate timeout based on file size"""
+    file_size_mb = get_file_size(file_path)
+    
+    # Base timeout: 2 minutes
+    base_timeout = 120
+    
+    # Additional time based on file size
+    if file_size_mb < 1:
+        additional_time = 60  # 1 minute for small files
+    elif file_size_mb < 10:
+        additional_time = 180  # 3 minutes for medium files
+    elif file_size_mb < 50:
+        additional_time = 600  # 10 minutes for large files
+    else:
+        additional_time = 1200  # 20 minutes for very large files
+    
+    total_timeout = base_timeout + additional_time
+    
+    logger.info(f"📏 File size: {file_size_mb:.2f}MB, Timeout: {total_timeout/60:.1f} minutes")
+    return total_timeout
+
 def safe_remove_file(file_path, max_attempts=3):
     """Safely remove a file with retry mechanism"""
     for attempt in range(max_attempts):
@@ -162,14 +191,17 @@ def create_temp_file(base_path):
     os.close(temp_fd)  # Close the file descriptor
     return temp_path
 
-def compress_single_pdf(input_file, output_file, quality_mode="balanced"):
-    """Compress a single PDF file with improved error handling and temp file management"""
+def compress_single_pdf(input_file, output_file, quality_mode="balanced", progress_callback=None):
+    """Compress a single PDF file with improved error handling and adaptive timeout"""
     file_start_time = time.time()
     
     if not os.path.exists(input_file):
         error_msg = f"❌ File not found: '{input_file}'"
         logger.error(error_msg)
         return False, error_msg
+
+    # Calculate appropriate timeout based on file size
+    timeout = calculate_timeout(input_file)
 
     # Create temporary file for processing
     temp_output_file = None
@@ -262,13 +294,58 @@ def compress_single_pdf(input_file, output_file, quality_mode="balanced"):
 
         # Track Ghostscript execution time
         gs_start_time = time.time()
-        result = subprocess.run(command, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+        
+        # Run with adaptive timeout
+        logger.info(f"🔄 Starting Ghostscript with {timeout/60:.1f} minute timeout...")
+        
+        # Create process with real-time monitoring
+        process = subprocess.Popen(
+            command, 
+            stdout=subprocess.PIPE, 
+            stderr=subprocess.PIPE,
+            text=True,
+            universal_newlines=True
+        )
+        
+        # Monitor process with periodic updates
+        poll_interval = 10  # Check every 10 seconds
+        elapsed_time = 0
+        
+        while process.poll() is None:
+            time.sleep(poll_interval)
+            elapsed_time += poll_interval
+            
+            # Update progress if callback provided
+            if progress_callback:
+                progress_callback(f"⏳ Processing... {elapsed_time//60:.0f}:{elapsed_time%60:02.0f} elapsed")
+            
+            logger.info(f"⏳ Ghostscript still running... {elapsed_time//60:.0f}:{elapsed_time%60:02.0f} elapsed")
+            
+            # Check timeout
+            if elapsed_time >= timeout:
+                logger.warning(f"⏰ Timeout reached ({timeout/60:.1f} minutes), terminating process...")
+                process.terminate()
+                try:
+                    process.wait(timeout=10)  # Wait 10 seconds for graceful termination
+                except subprocess.TimeoutExpired:
+                    logger.error("🔴 Force killing Ghostscript process")
+                    process.kill()
+                    process.wait()
+                
+                error_msg = f"❌ Ghostscript timeout ({timeout/60:.1f} minutes) for file: {input_file}"
+                logger.error(error_msg)
+                safe_remove_file(temp_output_file)
+                perf_tracker.track_file(input_file, file_start_time, success=False)
+                return False, error_msg
+        
+        # Get final result
+        stdout, stderr = process.communicate()
         gs_duration = time.time() - gs_start_time
         
-        if result.returncode != 0:
-            error_msg = f"❌ Ghostscript error (code {result.returncode}): {result.stderr}"
+        if process.returncode != 0:
+            error_msg = f"❌ Ghostscript error (code {process.returncode}): {stderr}"
             logger.error(error_msg)
-            logger.error(f"Ghostscript stdout: {result.stdout}")
+            logger.error(f"Ghostscript stdout: {stdout}")
             
             # Clean up temp file
             safe_remove_file(temp_output_file)
@@ -302,17 +379,9 @@ def compress_single_pdf(input_file, output_file, quality_mode="balanced"):
         
         # Log detailed timing info
         file_duration = time.time() - file_start_time
-        logger.info(f"📄 {os.path.basename(input_file)}: {file_duration:.2f}s (GS: {gs_duration:.2f}s)")
+        logger.info(f"✅ {os.path.basename(input_file)}: {file_duration:.2f}s (GS: {gs_duration:.2f}s)")
         
         return True, "✅ Compression successful"
-        
-    except subprocess.TimeoutExpired:
-        error_msg = f"❌ Ghostscript timeout (>5 minutes) for file: {input_file}"
-        logger.error(error_msg)
-        if temp_output_file:
-            safe_remove_file(temp_output_file)
-        perf_tracker.track_file(input_file, file_start_time, success=False)
-        return False, error_msg
         
     except Exception as e:
         error_msg = f"❌ Unexpected error processing {input_file}: {e}"
@@ -385,7 +454,12 @@ def compress_single_file_gui(input_file, quality_mode):
     base_name = os.path.splitext(input_file)[0]
     output_file = f"{base_name}_optimized_bw.pdf"
     
-    success, message = compress_single_pdf(input_file, output_file, quality_mode)
+    def update_progress(message):
+        """Update progress in GUI"""
+        result_label.config(text=message)
+        root.update()
+    
+    success, message = compress_single_pdf(input_file, output_file, quality_mode, update_progress)
     
     perf_tracker.track_phase("Finalizing")
     total_duration = perf_tracker.end_tracking()
@@ -428,6 +502,9 @@ def compress_directory(input_dir, quality_mode):
     
     logger.info(f"Found {len(pdf_files)} PDF files to process")
     
+    # Sort files by size (process smaller files first)
+    pdf_files.sort(key=get_file_size)
+    
     perf_tracker.track_phase("Directory Creation")
     
     # Create output directory
@@ -454,8 +531,10 @@ def compress_directory(input_dir, quality_mode):
         avg_time_per_file = elapsed / i if i > 0 else 0
         estimated_remaining = avg_time_per_file * (total_files - i)
         
+        file_size = get_file_size(pdf_file)
         progress_text = (
             f"🔄 Processing {i}/{total_files}: {os.path.basename(pdf_file)}\n"
+            f"📏 File size: {file_size:.2f} MB\n"
             f"⏱️ Elapsed: {elapsed:.1f}s | Estimated remaining: {estimated_remaining:.1f}s\n"
             f"✅ Successful: {successful_compressions} | ❌ Failed: {i - 1 - successful_compressions}"
         )
@@ -467,7 +546,17 @@ def compress_directory(input_dir, quality_mode):
         base_name = os.path.splitext(filename)[0]
         output_file = os.path.join(output_dir, f"{base_name}_optimized_bw.pdf")
         
-        success, message = compress_single_pdf(pdf_file, output_file, quality_mode)
+        def update_file_progress(message):
+            """Update progress for current file"""
+            current_progress = (
+                f"🔄 Processing {i}/{total_files}: {os.path.basename(pdf_file)}\n"
+                f"{message}\n"
+                f"✅ Successful: {successful_compressions} | ❌ Failed: {i - 1 - successful_compressions}"
+            )
+            result_label.config(text=current_progress)
+            root.update()
+        
+        success, message = compress_single_pdf(pdf_file, output_file, quality_mode, update_file_progress)
         
         if success:
             successful_compressions += 1
@@ -550,7 +639,7 @@ def open_log_file():
             messagebox.showerror("Error", f"Cannot open log file: {e}")
     else:
         messagebox.showinfo("Info", "Log file not found.")
-
+        
 def clear_results():
     """Clear the results display"""
     result_label.config(text="")
