@@ -1,854 +1,897 @@
-import os
-import sys
 import subprocess
-import argparse
-import shutil
-from pathlib import Path
-from typing import List, Optional, Tuple
+import os
+import time
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import threading
-import time
-import traceback
-import logging
+import glob
 from datetime import datetime
-import json
+import sys
+import io
+import logging
+import shutil
+import tempfile
+from pathlib import Path
 
+# Configure UTF-8 encoding
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
 
-def setup_logging():
-    """Set up comprehensive logging system."""
-    # Create logs directory
-    logs_dir = Path("logs")
-    logs_dir.mkdir(exist_ok=True)
-    
-    # Generate log filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = logs_dir / f"pdf_processor_{timestamp}.log"
-    
-    # Configure logging
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        handlers=[
-            logging.FileHandler(log_file, encoding='utf-8'),
-            logging.StreamHandler(sys.stdout)  # Also log to console in CLI mode
-        ]
-    )
-    
-    # Create separate loggers for different components
-    main_logger = logging.getLogger('PDFProcessor.Main')
-    processor_logger = logging.getLogger('PDFProcessor.Core')
-    gui_logger = logging.getLogger('PDFProcessor.GUI')
-    
-    main_logger.info(f"=== PDF Processor Session Started ===")
-    main_logger.info(f"Log file: {log_file}")
-    main_logger.info(f"Python version: {sys.version}")
-    main_logger.info(f"Platform: {sys.platform}")
-    main_logger.info(f"Working directory: {os.getcwd()}")
-    
-    return main_logger, processor_logger, gui_logger, log_file
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('pdf_compressor.log', encoding='utf-8'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
 
-
-def resource_path(relative_path):
-    """Get absolute path to resource, works for dev and for PyInstaller"""
-    logger = logging.getLogger('PDFProcessor.Main')
-    try:
-        # PyInstaller creates a temp folder and stores path in _MEIPASS
-        base_path = sys._MEIPASS
-        logger.debug(f"Running from PyInstaller bundle: {base_path}")
-    except Exception:
-        base_path = os.path.abspath(".")
-        logger.debug(f"Running from source: {base_path}")
-    
-    full_path = os.path.join(base_path, relative_path)
-    logger.debug(f"Resource path for '{relative_path}': {full_path}")
-    return full_path
-
-
-class PDFProcessor:
-    """Main PDF processing class using Ghostscript."""
-
-    def __init__(self, dpi: int = 200, paper_size: str = "a4", timeout: int = 1200):
-        self.logger = logging.getLogger('PDFProcessor.Core')
-        self.dpi = dpi
-        self.paper_size = paper_size.lower()
-        # Allow 0 or negative values to disable the timeout entirely
-        self.timeout = timeout
-
-        self.logger.info(
-            f"Initializing PDFProcessor with DPI={dpi}, paper_size={paper_size}, timeout={timeout}s"
-        )
-        
-        # Paper size mappings (width x height in points, 72 points = 1 inch)
-        self.paper_sizes = {
-            "a4": "595x842",
-            "letter": "612x792", 
-            "legal": "612x1008",
-            "a3": "842x1191"
-        }
-        
-        self.gs_command = self._find_ghostscript()
-        self.logger.info(f"Ghostscript command: {self.gs_command}")
-        
-        # Statistics tracking
-        self.stats = {
-            'start_time': None,
-            'end_time': None,
-            'total_files': 0,
-            'successful_files': 0,
-            'failed_files': 0,
-            'total_input_size': 0,
-            'total_output_size': 0,
-            'processing_times': [],
-            'errors': []
-        }
-        
-    def _find_ghostscript(self) -> str:
-        """Find Ghostscript executable on the system."""
-        self.logger.debug("Searching for Ghostscript executable")
-        possible_commands = ["gs", "gswin64c", "gswin32c", "ghostscript"]
-        
-        # Check PATH first
-        for cmd in possible_commands:
-            path = shutil.which(cmd)
-            if path:
-                self.logger.info(f"Found Ghostscript in PATH: {path}")
-                return cmd
-        
-        # Also check common installation paths on Windows
-        if sys.platform == "win32":
-            self.logger.debug("Checking common Windows installation paths")
-            common_paths = [
-                r"C:\Program Files\gs\gs*\bin\gswin64c.exe",
-                r"C:\Program Files (x86)\gs\gs*\bin\gswin32c.exe",
-                r"C:\gs\gs*\bin\gswin64c.exe",
-                r"C:\gs\gs*\bin\gswin32c.exe"
-            ]
-            
-            import glob
-            for path_pattern in common_paths:
-                self.logger.debug(f"Checking pattern: {path_pattern}")
-                matches = glob.glob(path_pattern)
-                if matches:
-                    self.logger.info(f"Found Ghostscript at: {matches[0]}")
-                    return matches[0]
-        
-        error_msg = (
-            "Ghostscript not found. Please install Ghostscript and ensure it's in your PATH.\n\n"
-            "Download from: https://www.ghostscript.com/download/gsdnld.html\n\n"
-            "For Windows: Install the 64-bit version and make sure it's added to PATH,\n"
-            "or install to default location (C:\\Program Files\\gs\\)"
-        )
-        self.logger.error(error_msg)
-        raise RuntimeError(error_msg)
-    
-    def _get_paper_size(self) -> str:
-        """Get paper size string for Ghostscript."""
-        size = self.paper_sizes.get(self.paper_size, self.paper_sizes["a4"])
-        self.logger.debug(f"Paper size '{self.paper_size}' resolved to: {size}")
-        return size
-    
-    def _get_file_size(self, file_path: Path) -> int:
-        """Get file size in bytes."""
-        try:
-            size = file_path.stat().st_size
-            self.logger.debug(f"File size for {file_path.name}: {size:,} bytes")
-            return size
-        except Exception as e:
-            self.logger.warning(f"Could not get file size for {file_path}: {e}")
-            return 0
-    
-    def _log_system_info(self):
-        """Log system information for debugging."""
-        try:
-            import platform
-            self.logger.info(f"System: {platform.system()} {platform.release()}")
-            self.logger.info(f"Architecture: {platform.architecture()}")
-            self.logger.info(f"Processor: {platform.processor()}")
-            
-            # Memory info (if available)
-            try:
-                import psutil
-                memory = psutil.virtual_memory()
-                self.logger.info(f"Total memory: {memory.total / (1024**3):.1f} GB")
-                self.logger.info(f"Available memory: {memory.available / (1024**3):.1f} GB")
-            except ImportError:
-                self.logger.debug("psutil not available, skipping memory info")
-        except Exception as e:
-            self.logger.warning(f"Could not gather system info: {e}")
-    
-    def process_pdf(self, input_path: Path, output_path: Path, progress_callback=None) -> bool:
-        """
-        Process a single PDF file with Ghostscript.
-        
-        Args:
-            input_path: Path to input PDF
-            output_path: Path for output PDF
-            progress_callback: Optional callback function for progress updates
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        start_time = time.time()
-        self.logger.info(f"Starting processing: {input_path}")
-        
-        try:
-            # Validate input file
-            if not input_path.exists():
-                raise FileNotFoundError(f"Input file does not exist: {input_path}")
-            
-            if not input_path.is_file():
-                raise ValueError(f"Input path is not a file: {input_path}")
-            
-            input_size = self._get_file_size(input_path)
-            self.stats['total_input_size'] += input_size
-            
-            # Ensure output directory exists
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            self.logger.debug(f"Output directory created/verified: {output_path.parent}")
-            
-            # Build Ghostscript command
-            paper_size = self._get_paper_size()
-            
-            cmd = [
-                self.gs_command,
-                "-sDEVICE=pdfwrite",
-                "-dCompatibilityLevel=1.4",
-                "-dColorConversionStrategy=/Gray",
-                "-dProcessColorModel=/DeviceGray",
-                "-dPDFSETTINGS=/ebook",
-                f"-dPDFFitPage",
-                f"-dFIXEDMEDIA",
-                f"-dDEVICEWIDTHPOINTS={paper_size.split('x')[0]}",
-                f"-dDEVICEHEIGHTPOINTS={paper_size.split('x')[1]}",
-                f"-r{self.dpi}",
-                "-dNOPAUSE",
-                "-dQUIET", 
-                "-dBATCH",
-                f"-sOutputFile={str(output_path)}",
-                str(input_path)
-            ]
-            
-            self.logger.debug(f"Ghostscript command: {' '.join(cmd)}")
-            
-            if progress_callback:
-                progress_callback(f"Processing: {input_path.name}")
-            
-            # Execute Ghostscript command
-            self.logger.debug("Executing Ghostscript command")
-            proc_timeout = self.timeout if self.timeout and self.timeout > 0 else None
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=proc_timeout,
-                creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
-            )
-            
-            processing_time = time.time() - start_time
-            self.stats['processing_times'].append(processing_time)
-            
-            self.logger.debug(f"Ghostscript return code: {result.returncode}")
-            self.logger.debug(f"Processing time: {processing_time:.2f} seconds")
-            
-            if result.stdout:
-                self.logger.debug(f"Ghostscript stdout: {result.stdout}")
-            
-            if result.returncode == 0:
-                # Check if output file was created
-                if output_path.exists():
-                    output_size = self._get_file_size(output_path)
-                    self.stats['total_output_size'] += output_size
-                    
-                    compression_ratio = (1 - output_size / input_size) * 100 if input_size > 0 else 0
-                    
-                    self.logger.info(f"✓ Successfully processed: {input_path.name}")
-                    self.logger.info(f"  Input size: {input_size:,} bytes")
-                    self.logger.info(f"  Output size: {output_size:,} bytes")
-                    self.logger.info(f"  Compression: {compression_ratio:.1f}%")
-                    self.logger.info(f"  Processing time: {processing_time:.2f}s")
-                    
-                    if progress_callback:
-                        progress_callback(f"✓ Completed: {input_path.name} ({compression_ratio:.1f}% compressed)")
-                    
-                    self.stats['successful_files'] += 1
-                    return True
-                else:
-                    error_msg = "Output file was not created"
-                    self.logger.error(f"✗ Processing failed: {input_path.name} - {error_msg}")
-                    self.stats['errors'].append({
-                        'file': str(input_path),
-                        'error': error_msg,
-                        'timestamp': datetime.now().isoformat()
-                    })
-                    if progress_callback:
-                        progress_callback(f"✗ Failed: {input_path.name} - {error_msg}")
-                    self.stats['failed_files'] += 1
-                    return False
-            else:
-                error_msg = result.stderr or result.stdout or "Unknown Ghostscript error"
-                self.logger.error(f"✗ Ghostscript failed for {input_path.name}")
-                self.logger.error(f"  Return code: {result.returncode}")
-                self.logger.error(f"  Error output: {error_msg}")
-                
-                self.stats['errors'].append({
-                    'file': str(input_path),
-                    'error': f"Ghostscript error (code {result.returncode}): {error_msg}",
-                    'timestamp': datetime.now().isoformat()
-                })
-                
-                if progress_callback:
-                    progress_callback(f"✗ Failed: {input_path.name} - {error_msg[:50]}...")
-                
-                self.stats['failed_files'] += 1
-                return False
-                
-        except subprocess.TimeoutExpired:
-            error_msg = f"Processing timeout after {self.timeout} seconds"
-            self.logger.error(f"✗ Timeout: {input_path.name} - {error_msg}")
-            self.stats['errors'].append({
-                'file': str(input_path),
-                'error': error_msg,
-                'timestamp': datetime.now().isoformat()
-            })
-            if progress_callback:
-                progress_callback(f"✗ Timeout: {input_path.name}")
-            self.stats['failed_files'] += 1
-            return False
-        except Exception as e:
-            error_msg = f"Unexpected error: {str(e)}"
-            self.logger.error(f"✗ Exception processing {input_path.name}: {error_msg}")
-            self.logger.error(f"  Exception type: {type(e).__name__}")
-            self.logger.error(f"  Traceback: {traceback.format_exc()}")
-            
-            self.stats['errors'].append({
-                'file': str(input_path),
-                'error': error_msg,
-                'exception_type': type(e).__name__,
-                'traceback': traceback.format_exc(),
-                'timestamp': datetime.now().isoformat()
-            })
-            
-            if progress_callback:
-                progress_callback(f"✗ Error: {input_path.name} - {str(e)[:50]}...")
-            
-            self.stats['failed_files'] += 1
-            return False
-    
-    def process_batch(self, input_paths: List[Path], output_dir: Path, progress_callback=None) -> Tuple[int, int]:
-        """
-        Process multiple PDF files.
-        
-        Args:
-            input_paths: List of input PDF paths
-            output_dir: Output directory
-            progress_callback: Optional callback for progress updates
-            
-        Returns:
-            Tuple of (successful_count, failed_count)
-        """
-        self.stats['start_time'] = datetime.now()
-        self.stats['total_files'] = len(input_paths)
-        
-        self.logger.info(f"=== BATCH PROCESSING STARTED ===")
-        self.logger.info(f"Total files to process: {len(input_paths)}")
-        self.logger.info(f"Output directory: {output_dir}")
-        self.logger.info(f"DPI: {self.dpi}, Paper size: {self.paper_size}")
-        
-        self._log_system_info()
-        
-        # Log all input files
-        self.logger.info("Input files:")
-        for i, path in enumerate(input_paths, 1):
-            size = self._get_file_size(path)
-            self.logger.info(f"  {i:2d}. {path.name} ({size:,} bytes)")
-        
-        successful = 0
-        failed = 0
-        total = len(input_paths)
-        
-        for i, input_path in enumerate(input_paths):
-            self.logger.info(f"--- Processing file {i+1}/{total} ---")
-            
-            if progress_callback:
-                progress_callback(f"Progress: {i+1}/{total} - {input_path.name}")
-            
-            # Generate output filename
-            output_filename = f"compressed_{input_path.stem}.pdf"
-            output_path = output_dir / output_filename
-            
-            self.logger.debug(f"Output path: {output_path}")
-            
-            if self.process_pdf(input_path, output_path, progress_callback):
-                successful += 1
-            else:
-                failed += 1
-            
-            # Log progress
-            self.logger.info(f"Progress: {i+1}/{total} completed (Success: {successful}, Failed: {failed})")
-        
-        self.stats['end_time'] = datetime.now()
-        self.stats['successful_files'] = successful
-        self.stats['failed_files'] = failed
-        
-        self._log_final_statistics()
-        
-        return successful, failed
-    
-    def _log_final_statistics(self):
-        """Log comprehensive final statistics."""
-        duration = (self.stats['end_time'] - self.stats['start_time']).total_seconds()
-        
-        self.logger.info("=== BATCH PROCESSING COMPLETED ===")
-        self.logger.info(f"Duration: {duration:.2f} seconds ({duration/60:.2f} minutes)")
-        self.logger.info(f"Total files: {self.stats['total_files']}")
-        self.logger.info(f"Successful: {self.stats['successful_files']}")
-        self.logger.info(f"Failed: {self.stats['failed_files']}")
-        self.logger.info(f"Success rate: {(self.stats['successful_files']/self.stats['total_files']*100):.1f}%")
-        
-        if self.stats['total_input_size'] > 0:
-            self.logger.info(f"Total input size: {self.stats['total_input_size']:,} bytes ({self.stats['total_input_size']/(1024**2):.1f} MB)")
-            self.logger.info(f"Total output size: {self.stats['total_output_size']:,} bytes ({self.stats['total_output_size']/(1024**2):.1f} MB)")
-            overall_compression = (1 - self.stats['total_output_size'] / self.stats['total_input_size']) * 100
-            self.logger.info(f"Overall compression: {overall_compression:.1f}%")
-        
-        if self.stats['processing_times']:
-            avg_time = sum(self.stats['processing_times']) / len(self.stats['processing_times'])
-            max_time = max(self.stats['processing_times'])
-            min_time = min(self.stats['processing_times'])
-            self.logger.info(f"Processing times - Avg: {avg_time:.2f}s, Min: {min_time:.2f}s, Max: {max_time:.2f}s")
-        
-        # Log errors summary
-        if self.stats['errors']:
-            self.logger.error(f"=== ERROR SUMMARY ({len(self.stats['errors'])} errors) ===")
-            for error in self.stats['errors']:
-                self.logger.error(f"File: {error['file']}")
-                self.logger.error(f"Error: {error['error']}")
-                self.logger.error(f"Time: {error['timestamp']}")
-                if 'exception_type' in error:
-                    self.logger.error(f"Exception type: {error['exception_type']}")
-                self.logger.error("---")
-        
-        # Save statistics to JSON file
-        try:
-            stats_file = Path("logs") / f"processing_stats_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
-            
-            # Convert datetime objects to ISO format for JSON serialization
-            json_stats = self.stats.copy()
-            json_stats['start_time'] = self.stats['start_time'].isoformat() if self.stats['start_time'] else None
-            json_stats['end_time'] = self.stats['end_time'].isoformat() if self.stats['end_time'] else None
-            json_stats['duration_seconds'] = duration
-            
-            with open(stats_file, 'w', encoding='utf-8') as f:
-                json.dump(json_stats, f, indent=2, ensure_ascii=False)
-            
-            self.logger.info(f"Statistics saved to: {stats_file}")
-        except Exception as e:
-            self.logger.warning(f"Could not save statistics to JSON: {e}")
-
-
-class PDFProcessorGUI:
-    """GUI interface for PDF processing."""
+class PerformanceTracker:
+    """Enhanced performance tracker with better metrics and logging"""
     
     def __init__(self):
-        self.logger = logging.getLogger('PDFProcessor.GUI')
-        self.logger.info("Initializing GUI")
+        self.start_time = None
+        self.end_time = None
+        self.file_times = {}
+        self.phase_times = {}
+        self.failed_files = []
+        self.successful_files = []
         
-        self.root = tk.Tk()
-        self.root.title("PDF Batch Processor v1.1 (Enhanced Logging)")
-        self.root.geometry("650x500")
+    def start_tracking(self, operation_name="Operation"):
+        """Start timing an operation"""
+        self.start_time = time.time()
+        self.operation_name = operation_name
+        self.failed_files = []
+        self.successful_files = []
+        timestamp = datetime.now().strftime('%H:%M:%S')
+        message = f"⏱️ Starting {operation_name} at {timestamp}"
+        print(message)
+        logger.info(message)
         
-        # Set window icon if available
-        try:
-            icon_path = resource_path("icon.ico")
-            if os.path.exists(icon_path):
-                self.root.iconbitmap(icon_path)
-                self.logger.debug(f"Window icon set: {icon_path}")
-        except Exception as e:
-            self.logger.debug(f"Could not set window icon: {e}")
+    def track_phase(self, phase_name):
+        """Track time for a specific phase"""
+        current_time = time.time()
+        if hasattr(self, '_last_phase_time'):
+            phase_duration = current_time - self._last_phase_time
+            self.phase_times[self._last_phase_name] = phase_duration
+            logger.debug(f"Phase '{self._last_phase_name}' completed in {phase_duration:.2f}s")
+        self._last_phase_time = current_time
+        self._last_phase_name = phase_name
         
-        # Center window on screen
-        self.center_window()
+    def track_file(self, filename, file_start_time, success=True):
+        """Track time for individual file processing"""
+        file_duration = time.time() - file_start_time
+        self.file_times[filename] = file_duration
         
-        self.processor = None
-        self.input_paths = []
-        self.output_dir = None
-        self.processing_thread = None
-        
-        self.setup_gui()
-        
-        # Handle window closing
-        self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
-        
-        self.logger.info("GUI initialization completed")
-        
-    def center_window(self):
-        """Center the window on the screen."""
-        self.root.update_idletasks()
-        width = self.root.winfo_width()
-        height = self.root.winfo_height()
-        x = (self.root.winfo_screenwidth() // 2) - (width // 2)
-        y = (self.root.winfo_screenheight() // 2) - (height // 2)
-        self.root.geometry(f"{width}x{height}+{x}+{y}")
-        self.logger.debug(f"Window centered at {x},{y} with size {width}x{height}")
-    
-    def setup_gui(self):
-        """Set up the GUI components."""
-        # Main frame
-        main_frame = ttk.Frame(self.root, padding="10")
-        main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
-        # Title
-        title_label = ttk.Label(main_frame, text="PDF Batch Processor v1.1", font=("Arial", 16, "bold"))
-        title_label.grid(row=0, column=0, columnspan=2, pady=(0, 5))
-        
-        # Subtitle with logging info
-        subtitle_label = ttk.Label(main_frame, text="Enhanced with comprehensive logging", font=("Arial", 9), foreground="gray")
-        subtitle_label.grid(row=1, column=0, columnspan=2, pady=(0, 10))
-        
-        # Configuration frame
-        config_frame = ttk.LabelFrame(main_frame, text="Configuration", padding="10")
-        config_frame.grid(row=2, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        
-        # DPI setting
-        ttk.Label(config_frame, text="DPI:").grid(row=0, column=0, sticky=tk.W)
-        self.dpi_var = tk.StringVar(value="200")
-        dpi_combo = ttk.Combobox(config_frame, textvariable=self.dpi_var, values=["150", "200", "300", "600"], width=10, state="readonly")
-        dpi_combo.grid(row=0, column=1, sticky=tk.W, padx=(5, 20))
-        
-        # Paper size setting
-        ttk.Label(config_frame, text="Paper Size:").grid(row=0, column=2, sticky=tk.W)
-        self.paper_var = tk.StringVar(value="a4")
-        paper_combo = ttk.Combobox(config_frame, textvariable=self.paper_var, values=["a4", "letter", "legal", "a3"], width=10, state="readonly")
-        paper_combo.grid(row=0, column=3, sticky=tk.W, padx=(5, 20))
-
-        # Timeout setting
-        ttk.Label(config_frame, text="Timeout (s):").grid(row=0, column=4, sticky=tk.W)
-        self.timeout_var = tk.StringVar(value="1200")
-        timeout_entry = ttk.Entry(config_frame, textvariable=self.timeout_var, width=10)
-        timeout_entry.grid(row=0, column=5, sticky=tk.W, padx=(5, 0))
-        
-        # File selection frame
-        file_frame = ttk.LabelFrame(main_frame, text="File Selection", padding="10")
-        file_frame.grid(row=3, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        
-        # Buttons
-        button_frame = ttk.Frame(file_frame)
-        button_frame.grid(row=0, column=0, sticky=(tk.W, tk.E))
-        
-        ttk.Button(button_frame, text="Select PDF Files", command=self.select_files).grid(row=0, column=0, padx=(0, 5))
-        ttk.Button(button_frame, text="Select Folder", command=self.select_folder).grid(row=0, column=1, padx=(0, 5))
-        ttk.Button(button_frame, text="Clear Selection", command=self.clear_selection).grid(row=0, column=2, padx=(0, 5))
-        ttk.Button(button_frame, text="View Logs", command=self.view_logs).grid(row=0, column=3)
-        
-        # Selected files display
-        text_frame = ttk.Frame(file_frame)
-        text_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), pady=(10, 0))
-        
-        self.files_text = tk.Text(text_frame, height=6, width=70, wrap=tk.WORD)
-        scrollbar = ttk.Scrollbar(text_frame, orient="vertical", command=self.files_text.yview)
-        
-        self.files_text.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        self.files_text.configure(yscrollcommand=scrollbar.set)
-        
-        text_frame.columnconfigure(0, weight=1)
-        text_frame.rowconfigure(0, weight=1)
-        
-        # Progress frame
-        progress_frame = ttk.LabelFrame(main_frame, text="Progress", padding="10")
-        progress_frame.grid(row=4, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        
-        self.progress_var = tk.StringVar(value="Ready - Select PDF files to begin")
-        self.progress_label = ttk.Label(progress_frame, textvariable=self.progress_var)
-        self.progress_label.grid(row=0, column=0, sticky=tk.W)
-        
-        self.progress_bar = ttk.Progressbar(progress_frame, mode='indeterminate')
-        self.progress_bar.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(5, 0))
-        
-        # Process button
-        self.process_button = ttk.Button(main_frame, text="Process PDFs", command=self.start_processing)
-        self.process_button.grid(row=5, column=0, columnspan=2, pady=(0, 10))
-        
-        # Status bar
-        self.status_var = tk.StringVar(value="Ready")
-        status_bar = ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W)
-        status_bar.grid(row=6, column=0, columnspan=2, sticky=(tk.W, tk.E))
-        
-        # Configure grid weights
-        self.root.columnconfigure(0, weight=1)
-        self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(0, weight=1)
-        main_frame.rowconfigure(3, weight=1)
-        file_frame.columnconfigure(0, weight=1)
-        file_frame.rowconfigure(1, weight=1)
-        progress_frame.columnconfigure(0, weight=1)
-        
-        self.logger.debug("GUI setup completed")
-    
-    def view_logs(self):
-        """Open the logs directory."""
-        logs_dir = Path("logs")
-        if logs_dir.exists():
-            if sys.platform == "win32":
-                os.startfile(logs_dir)
-            elif sys.platform == "darwin":
-                subprocess.run(["open", str(logs_dir)])
-            else:
-                subprocess.run(["xdg-open", str(logs_dir)])
-            self.logger.info("Opened logs directory")
+        if success:
+            self.successful_files.append(filename)
+            logger.info(f"✅ Successfully processed: {os.path.basename(filename)} ({file_duration:.2f}s)")
         else:
-            messagebox.showinfo("No Logs", "No log files found. Logs will be created when processing starts.")
-    
-    def select_files(self):
-        """Select individual PDF files."""
-        self.logger.debug("User selecting individual files")
-        files = filedialog.askopenfilenames(
-            title="Select PDF files",
-            filetypes=[("PDF files", "*.pdf"), ("All files", "*.*")]
-        )
+            self.failed_files.append(filename)
+            logger.error(f"❌ Failed to process: {os.path.basename(filename)} ({file_duration:.2f}s)")
         
-        if files:
-            self.input_paths = [Path(f) for f in files]
-            self.output_dir = self.input_paths[0].parent / "compressed"
-            self.update_files_display()
-            self.status_var.set(f"Selected {len(files)} PDF file(s)")
-            self.logger.info(f"User selected {len(files)} individual files")
-            for file in files:
-                self.logger.debug(f"Selected file: {file}")
-    
-    def select_folder(self):
-        """Select a folder containing PDF files."""
-        self.logger.debug("User selecting folder")
-        folder = filedialog.askdirectory(title="Select folder containing PDFs")
+    def end_tracking(self):
+        """End timing and calculate total duration"""
+        self.end_time = time.time()
+        total_duration = self.end_time - self.start_time
         
-        if folder:
-            folder_path = Path(folder)
-            pdf_files = list(folder_path.glob("*.pdf"))
+        # Track final phase
+        if hasattr(self, '_last_phase_time'):
+            phase_duration = self.end_time - self._last_phase_time
+            self.phase_times[self._last_phase_name] = phase_duration
             
-            self.logger.info(f"Scanning folder: {folder}")
-            self.logger.info(f"Found {len(pdf_files)} PDF files")
+        message = f"⏱️ {self.operation_name} completed in {total_duration:.2f} seconds"
+        print(message)
+        logger.info(message)
+        logger.info(f"Success rate: {len(self.successful_files)}/{len(self.successful_files) + len(self.failed_files)} files")
+        
+        return total_duration
+        
+    def get_detailed_report(self):
+        """Generate detailed performance report"""
+        total_duration = self.end_time - self.start_time if self.end_time and self.start_time else 0
+        
+        report = f"📊 Performance Report:\n"
+        report += f"⏱️ Total Duration: {total_duration:.2f} seconds\n"
+        report += f"✅ Successful: {len(self.successful_files)} files\n"
+        report += f"❌ Failed: {len(self.failed_files)} files\n"
+        
+        if self.phase_times:
+            report += f"\n🔄 Phase Breakdown:\n"
+            for phase, duration in self.phase_times.items():
+                percentage = (duration / total_duration * 100) if total_duration > 0 else 0
+                report += f"  • {phase}: {duration:.2f}s ({percentage:.1f}%)\n"
+        
+        if self.file_times:
+            report += f"\n📄 File Processing Times:\n"
+            sorted_files = sorted(self.file_times.items(), key=lambda x: x[1], reverse=True)
+            for filename, duration in sorted_files[:5]:  # Show top 5 slowest files
+                report += f"  • {os.path.basename(filename)}: {duration:.2f}s\n"
             
-            if pdf_files:
-                self.input_paths = pdf_files
-                self.output_dir = folder_path / "compressed"
-                self.update_files_display()
-                self.status_var.set(f"Found {len(pdf_files)} PDF file(s) in folder")
+            if len(sorted_files) > 5:
+                report += f"  ... and {len(sorted_files) - 5} more files\n"
                 
-                for file in pdf_files:
-                    self.logger.debug(f"Found PDF: {file}")
+            avg_time = sum(self.file_times.values()) / len(self.file_times)
+            report += f"\n📈 Average per file: {avg_time:.2f}s\n"
+            report += f"🐌 Slowest file: {max(self.file_times.values()):.2f}s\n"
+            report += f"⚡ Fastest file: {min(self.file_times.values()):.2f}s\n"
+        
+        if self.failed_files:
+            report += f"\n❌ Failed Files:\n"
+            for failed_file in self.failed_files:
+                report += f"  • {os.path.basename(failed_file)}\n"
+        
+        return report
+
+# Global performance tracker
+perf_tracker = PerformanceTracker()
+
+def safe_remove_file(file_path, max_attempts=3):
+    """Safely remove a file with retry mechanism"""
+    for attempt in range(max_attempts):
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+                logger.debug(f"Successfully removed: {file_path}")
+                return True
+        except PermissionError as e:
+            logger.warning(f"Attempt {attempt + 1}/{max_attempts} failed to remove {file_path}: {e}")
+            if attempt < max_attempts - 1:
+                time.sleep(0.5)  # Wait before retry
             else:
-                messagebox.showwarning("No PDFs Found", "No PDF files found in the selected folder.")
-                self.status_var.set("No PDFs found in selected folder")
-                self.logger.warning(f"No PDF files found in folder: {folder}")
-    
-    def clear_selection(self):
-        """Clear file selection."""
-        self.input_paths = []
-        self.output_dir = None
-        self.update_files_display()
-        self.status_var.set("Selection cleared")
-    
-    def update_files_display(self):
-        """Update the files display text widget."""
-        self.files_text.delete(1.0, tk.END)
-        
-        if self.input_paths:
-            self.files_text.insert(tk.END, f"Selected {len(self.input_paths)} PDF file(s):\n\n")
-            for i, path in enumerate(self.input_paths, 1):
-                self.files_text.insert(tk.END, f"{i:2d}. {path.name}\n")
-            self.files_text.insert(tk.END, f"\nOutput folder: {self.output_dir}")
-        else:
-            self.files_text.insert(tk.END, "No files selected\n\n")
-            self.files_text.insert(tk.END, "Click 'Select PDF Files' to choose individual files\n")
-            self.files_text.insert(tk.END, "or 'Select Folder' to process all PDFs in a folder.")
-    
-    def update_progress(self, message):
-        """Update progress display."""
-        self.progress_var.set(message)
-        self.root.update_idletasks()
-    
-    def start_processing(self):
-        """Start PDF processing in a separate thread."""
-        if not self.input_paths:
-            messagebox.showwarning("No Files", "Please select PDF files or folder first.")
-            return
-        
-        try:
-            # Test Ghostscript availability
-            dpi = int(self.dpi_var.get())
-            paper_size = self.paper_var.get()
-            timeout = int(self.timeout_var.get())
-            test_processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=timeout)
-            
+                logger.error(f"Failed to remove {file_path} after {max_attempts} attempts")
+                return False
         except Exception as e:
-            messagebox.showerror("Ghostscript Error", str(e))
-            return
-        
-        # Disable process button
-        self.process_button.configure(state="disabled")
-        self.progress_bar.start()
-        self.status_var.set("Processing...")
-        
-        # Start processing thread
-        thread = threading.Thread(target=self.process_pdfs_thread)
-        thread.daemon = True
-        thread.start()
-    
-    def process_pdfs_thread(self):
-        """Process PDFs in background thread."""
-        try:
-            dpi = int(self.dpi_var.get())
-            paper_size = self.paper_var.get()
-            timeout = int(self.timeout_var.get())
+            logger.error(f"Unexpected error removing {file_path}: {e}")
+            return False
+    return False
 
-            self.processor = PDFProcessor(dpi=dpi, paper_size=paper_size, timeout=timeout)
-            
-            successful, failed = self.processor.process_batch(
-                self.input_paths,
-                self.output_dir,
-                progress_callback=self.update_progress
-            )
-            
-            # Update UI on completion
-            self.root.after(0, self.processing_completed, successful, failed)
-            
-        except Exception as e:
-            error_msg = f"Processing error: {str(e)}"
-            self.root.after(0, self.processing_error, error_msg)
+def create_temp_file(base_path):
+    """Create a temporary file in the same directory as the base file"""
+    directory = os.path.dirname(base_path)
+    basename = os.path.basename(base_path)
+    name, ext = os.path.splitext(basename)
     
-    def processing_completed(self, successful, failed):
-        """Handle processing completion."""
-        self.progress_bar.stop()
-        self.process_button.configure(state="normal")
-        
-        total = successful + failed
-        message = f"Processing completed!\n\nTotal files: {total}\nSuccessful: {successful}\nFailed: {failed}"
-        
-        if failed == 0:
-            messagebox.showinfo("Success", message + f"\n\nOutput folder: {self.output_dir}")
-            self.status_var.set(f"Completed successfully - {successful} files processed")
-        else:
-            messagebox.showwarning("Completed with Errors", message)
-            self.status_var.set(f"Completed with errors - {successful} successful, {failed} failed")
-        
-        self.progress_var.set("Ready - Select PDF files to begin")
-    
-    def processing_error(self, error_message):
-        """Handle processing error."""
-        self.progress_bar.stop()
-        self.process_button.configure(state="normal")
-        messagebox.showerror("Processing Error", error_message)
-        self.progress_var.set("Ready - Error occurred")
-        self.status_var.set("Error occurred during processing")
-    
-    def on_closing(self):
-        """Handle application closing."""
-        self.root.quit()
-        self.root.destroy()
-    
-    def run(self):
-        """Run the GUI application."""
-        try:
-            self.root.mainloop()
-        except Exception as e:
-            messagebox.showerror("Application Error", f"An unexpected error occurred:\n{str(e)}")
+    # Create temporary file with unique name
+    temp_fd, temp_path = tempfile.mkstemp(
+        suffix=f"_compress{ext}",
+        prefix=f"{name}_",
+        dir=directory
+    )
+    os.close(temp_fd)  # Close the file descriptor
+    return temp_path
 
+def compress_single_pdf(input_file, output_file, quality_mode="balanced"):
+    """Compress a single PDF file with improved error handling and temp file management"""
+    file_start_time = time.time()
+    
+    if not os.path.exists(input_file):
+        error_msg = f"❌ File not found: '{input_file}'"
+        logger.error(error_msg)
+        return False, error_msg
 
-def cli_interface():
-    """Command-line interface for PDF processing."""
-    parser = argparse.ArgumentParser(description="Batch PDF processor using Ghostscript")
-    parser.add_argument("input", help="Input PDF file or folder containing PDFs")
-    parser.add_argument("-o", "--output", help="Output folder (default: creates 'compressed' folder)")
-    parser.add_argument("-d", "--dpi", type=int, default=200, help="Output DPI (default: 200)")
-    parser.add_argument("-p", "--paper", default="a4", choices=["a4", "letter", "legal", "a3"],
-                       help="Paper size (default: a4)")
-    parser.add_argument("-t", "--timeout", type=int, default=1200,
-                        help="Ghostscript timeout in seconds (0 for no timeout, default: 1200)")
-    
-    args = parser.parse_args()
-    
-    # Determine input paths
-    input_path = Path(args.input)
-    
-    if input_path.is_file() and input_path.suffix.lower() == ".pdf":
-        input_paths = [input_path]
-        output_dir = input_path.parent / "compressed"
-    elif input_path.is_dir():
-        input_paths = list(input_path.glob("*.pdf"))
-        output_dir = input_path / "compressed"
-        if not input_paths:
-            print("No PDF files found in the specified folder.")
-            return 1
-    else:
-        print("Input must be a PDF file or folder containing PDFs.")
-        return 1
-    
-    # Set output directory
-    if args.output:
-        output_dir = Path(args.output)
-    
-    print(f"PDF Batch Processor v1.0")
-    print(f"Found {len(input_paths)} PDF file(s)")
-    print(f"Output folder: {output_dir}")
-    timeout_display = f"{args.timeout}s" if args.timeout and args.timeout > 0 else "no limit"
-    print(f"Settings: DPI={args.dpi}, Paper={args.paper}, Timeout={timeout_display}")
-    print("-" * 50)
-    
-    # Process files
+    # Create temporary file for processing
+    temp_output_file = None
     try:
-        processor = PDFProcessor(dpi=args.dpi, paper_size=args.paper, timeout=args.timeout)
+        temp_output_file = create_temp_file(output_file)
+        logger.debug(f"Created temp file: {temp_output_file}")
         
-        def progress_callback(message):
-            print(message)
+        # Quality presets for scanned documents
+        quality_settings = {
+            "high": {
+                "dpi": 300,
+                "jpeg_quality": 85,
+                "pdfsettings": "/prepress"
+            },
+            "balanced": {
+                "dpi": 200,
+                "jpeg_quality": 70,
+                "pdfsettings": "/ebook"
+            },
+            "compact": {
+                "dpi": 150,
+                "jpeg_quality": 60,
+                "pdfsettings": "/screen"
+            }
+        }
         
-        successful, failed = processor.process_batch(input_paths, output_dir, progress_callback)
+        settings = quality_settings.get(quality_mode, quality_settings["balanced"])
+        logger.info(f"Using quality settings: {quality_mode} ({settings['dpi']}dpi)")
+
+        command = [
+            "gswin64c",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            f"-dPDFSETTINGS={settings['pdfsettings']}",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-dBATCH",
+            "-dSAFER",
+            
+            # A4 page settings
+            "-sPAPERSIZE=a4",
+            "-dFIXEDMEDIA",
+            "-dPDFFitPage",
+            "-dAutoRotatePages=/None",
+            
+            # B&W conversion settings
+            "-sColorConversionStrategy=Gray",
+            "-dProcessColorModel=/DeviceGray",
+            "-dConvertCMYKImagesToRGB=false",
+            
+            # Image compression settings optimized for scanned documents
+            "-dDownsampleColorImages=true",
+            "-dDownsampleGrayImages=true",
+            "-dDownsampleMonoImages=false",
+            
+            # Downsampling methods
+            "-dColorImageDownsampleType=/Bicubic",
+            "-dGrayImageDownsampleType=/Bicubic",
+            "-dMonoImageDownsampleType=/Subsample",
+            
+            # Resolution settings
+            f"-dColorImageResolution={settings['dpi']}",
+            f"-dGrayImageResolution={settings['dpi']}",
+            "-dMonoImageResolution=600",
+            
+            # Compression filters
+            "-dAutoFilterColorImages=false",
+            "-dAutoFilterGrayImages=false",
+            "-dColorImageFilter=/DCTEncode",
+            "-dGrayImageFilter=/DCTEncode",
+            "-dMonoImageFilter=/CCITTFaxEncode",
+            
+            # JPEG quality
+            f"-dJPEGQ={settings['jpeg_quality']}",
+            
+            # Additional optimization for scanned documents
+            "-dDetectDuplicateImages=true",
+            "-dCompressFonts=true",
+            "-dSubsetFonts=true",
+            "-dCompressPages=true",
+            "-dUseFlateCompression=true",
+            
+            # Output file
+            "-sOutputFile=" + temp_output_file,
+            input_file
+        ]
+
+        # Log the command for debugging
+        logger.debug(f"Ghostscript command: {' '.join(command)}")
+
+        # Track Ghostscript execution time
+        gs_start_time = time.time()
+        result = subprocess.run(command, capture_output=True, text=True, timeout=300)  # 5 minute timeout
+        gs_duration = time.time() - gs_start_time
         
-        print("-" * 50)
-        print(f"Processing completed!")
-        print(f"Successful: {successful}")
-        print(f"Failed: {failed}")
+        if result.returncode != 0:
+            error_msg = f"❌ Ghostscript error (code {result.returncode}): {result.stderr}"
+            logger.error(error_msg)
+            logger.error(f"Ghostscript stdout: {result.stdout}")
+            
+            # Clean up temp file
+            safe_remove_file(temp_output_file)
+            perf_tracker.track_file(input_file, file_start_time, success=False)
+            return False, error_msg
         
-        return 0 if failed == 0 else 1
+        # Check if output file was created and is valid
+        if not os.path.exists(temp_output_file) or os.path.getsize(temp_output_file) == 0:
+            error_msg = f"❌ Output file not created or empty: {temp_output_file}"
+            logger.error(error_msg)
+            safe_remove_file(temp_output_file)
+            perf_tracker.track_file(input_file, file_start_time, success=False)
+            return False, error_msg
+        
+        # Remove existing output file if it exists
+        safe_remove_file(output_file)
+        
+        # Move temp file to final location
+        try:
+            shutil.move(temp_output_file, output_file)
+            logger.info(f"Successfully moved temp file to: {output_file}")
+        except Exception as e:
+            error_msg = f"❌ Failed to move temp file to final location: {e}"
+            logger.error(error_msg)
+            safe_remove_file(temp_output_file)
+            perf_tracker.track_file(input_file, file_start_time, success=False)
+            return False, error_msg
+        
+        # Track successful file processing
+        perf_tracker.track_file(input_file, file_start_time, success=True)
+        
+        # Log detailed timing info
+        file_duration = time.time() - file_start_time
+        logger.info(f"📄 {os.path.basename(input_file)}: {file_duration:.2f}s (GS: {gs_duration:.2f}s)")
+        
+        return True, "✅ Compression successful"
+        
+    except subprocess.TimeoutExpired:
+        error_msg = f"❌ Ghostscript timeout (>5 minutes) for file: {input_file}"
+        logger.error(error_msg)
+        if temp_output_file:
+            safe_remove_file(temp_output_file)
+        perf_tracker.track_file(input_file, file_start_time, success=False)
+        return False, error_msg
         
     except Exception as e:
-        print(f"Error: {e}")
-        return 1
+        error_msg = f"❌ Unexpected error processing {input_file}: {e}"
+        logger.error(error_msg)
+        if temp_output_file:
+            safe_remove_file(temp_output_file)
+        perf_tracker.track_file(input_file, file_start_time, success=False)
+        return False, error_msg
 
+def compress_pdf():
+    """Main compression function that handles both single files and directories"""
+    input_path = input_entry.get().strip()
+    quality_mode = quality_var.get()
+    
+    if not input_path:
+        messagebox.showwarning("Empty Field", "Please select a PDF file or directory.")
+        return
 
-def main():
-    """Main entry point."""
-    main_logger, _, _, _ = setup_logging()
-    main_logger.info("Application starting")
-    # Set up exception handling for GUI mode
-    def handle_exception(exc_type, exc_value, exc_traceback):
-        if issubclass(exc_type, KeyboardInterrupt):
-            sys.__excepthook__(exc_type, exc_value, exc_traceback)
-            return
-        
-        error_msg = "".join(traceback.format_exception(exc_type, exc_value, exc_traceback))
-        print(f"Unhandled exception: {error_msg}")
-        
-        if tk._default_root:
-            messagebox.showerror("Unexpected Error", 
-                               f"An unexpected error occurred:\n\n{exc_type.__name__}: {exc_value}")
+    if not os.path.exists(input_path):
+        error_msg = f"❌ Path not found: '{input_path}'"
+        messagebox.showerror("Error", error_msg)
+        logger.error(error_msg)
+        return
+
+    # Check if Ghostscript is available
+    try:
+        subprocess.run(["gswin64c", "-version"], capture_output=True, check=True)
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        error_msg = "❌ Ghostscript not found. Please install Ghostscript first."
+        messagebox.showerror("Error", error_msg)
+        logger.error(error_msg)
+        return
+
+    result_label.config(text="🔄 Compression in progress...")
+    root.update()
     
-    sys.excepthook = handle_exception
+    threading.Thread(target=process_compression, args=(input_path, quality_mode), daemon=True).start()
+
+def process_compression(input_path, quality_mode):
+    """Process compression in a separate thread"""
+    try:
+        # Start performance tracking
+        if os.path.isfile(input_path):
+            perf_tracker.start_tracking("Single File Compression")
+        else:
+            perf_tracker.start_tracking("Batch Compression")
+        
+        perf_tracker.track_phase("Initialization")
+        
+        if os.path.isfile(input_path):
+            # Single PDF file
+            compress_single_file_gui(input_path, quality_mode)
+        elif os.path.isdir(input_path):
+            # Directory with PDFs
+            compress_directory(input_path, quality_mode)
+        else:
+            error_msg = "❌ Unsupported file type."
+            result_label.config(text=error_msg)
+            logger.error(error_msg)
+            
+    except Exception as e:
+        error_msg = f"❌ Unexpected error in compression process: {e}"
+        result_label.config(text=error_msg)
+        logger.error(error_msg)
+
+def compress_single_file_gui(input_file, quality_mode):
+    """Compress a single PDF file (GUI version)"""
+    perf_tracker.track_phase("File Processing")
     
-    if len(sys.argv) > 1:
-        # CLI mode
-        main_logger.info("Running in CLI mode")
-        sys.exit(cli_interface())
+    base_name = os.path.splitext(input_file)[0]
+    output_file = f"{base_name}_optimized_bw.pdf"
+    
+    success, message = compress_single_pdf(input_file, output_file, quality_mode)
+    
+    perf_tracker.track_phase("Finalizing")
+    total_duration = perf_tracker.end_tracking()
+    
+    if success:
+        original_size = os.path.getsize(input_file)
+        compressed_size = os.path.getsize(output_file)
+        gain = ((original_size - compressed_size) / original_size) * 100
+        
+        processing_speed = original_size / (1024 * 1024) / total_duration  # MB/s
+        
+        result_text = (
+            f"✅ Completed in {total_duration:.2f} sec\n"
+            f"📄 Original size: {original_size / 1024 / 1024:.2f} MB\n"
+            f"📉 Compressed size: {compressed_size / 1024 / 1024:.2f} MB\n"
+            f"💾 Space saved: {gain:.1f}%\n"
+            f"⚡ Processing speed: {processing_speed:.2f} MB/s\n"
+            f"⚙️ Quality: {quality_mode.upper()}\n"
+            f"📁 Output file: {os.path.basename(output_file)}\n\n"
+            f"{perf_tracker.get_detailed_report()}"
+        )
+        result_label.config(text=result_text)
+        logger.info(f"✅ File compressed successfully: {output_file}")
     else:
-        # GUI mode
-        main_logger.info("Running in GUI mode")
-        try:
-            app = PDFProcessorGUI()
-            app.run()
-        except Exception as e:
-            print(f"GUI Error: {e}")
-            print("Usage: python pdf_processor.py <input_file_or_folder> [options]")
+        result_label.config(text=f"❌ Compression failed: {message}")
+        logger.error(f"❌ Compression failed: {message}")
 
+def compress_directory(input_dir, quality_mode):
+    """Compress all PDF files in a directory"""
+    perf_tracker.track_phase("Directory Scanning")
+    
+    # Find all PDF files in the directory
+    pdf_files = glob.glob(os.path.join(input_dir, "*.pdf"))
+    
+    if not pdf_files:
+        error_msg = "❌ No PDF files found in the directory."
+        result_label.config(text=error_msg)
+        logger.warning(error_msg)
+        return
+    
+    logger.info(f"Found {len(pdf_files)} PDF files to process")
+    
+    perf_tracker.track_phase("Directory Creation")
+    
+    # Create output directory
+    output_dir = f"{input_dir}_optimized_bw"
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(f"Created output directory: {output_dir}")
+    except Exception as e:
+        error_msg = f"❌ Failed to create output directory: {e}"
+        result_label.config(text=error_msg)
+        logger.error(error_msg)
+        return
+    
+    perf_tracker.track_phase("Batch Processing")
+    
+    total_files = len(pdf_files)
+    successful_compressions = 0
+    total_original_size = 0
+    total_compressed_size = 0
+    
+    for i, pdf_file in enumerate(pdf_files, 1):
+        # Update progress with time estimate
+        elapsed = time.time() - perf_tracker.start_time
+        avg_time_per_file = elapsed / i if i > 0 else 0
+        estimated_remaining = avg_time_per_file * (total_files - i)
+        
+        progress_text = (
+            f"🔄 Processing {i}/{total_files}: {os.path.basename(pdf_file)}\n"
+            f"⏱️ Elapsed: {elapsed:.1f}s | Estimated remaining: {estimated_remaining:.1f}s\n"
+            f"✅ Successful: {successful_compressions} | ❌ Failed: {i - 1 - successful_compressions}"
+        )
+        result_label.config(text=progress_text)
+        root.update()
+        
+        # Create output filename in the new directory
+        filename = os.path.basename(pdf_file)
+        base_name = os.path.splitext(filename)[0]
+        output_file = os.path.join(output_dir, f"{base_name}_optimized_bw.pdf")
+        
+        success, message = compress_single_pdf(pdf_file, output_file, quality_mode)
+        
+        if success:
+            successful_compressions += 1
+            total_original_size += os.path.getsize(pdf_file)
+            total_compressed_size += os.path.getsize(output_file)
+            logger.info(f"✅ Compressed: {filename}")
+        else:
+            logger.error(f"❌ Failed: {filename} - {message}")
+    
+    perf_tracker.track_phase("Finalizing")
+    total_duration = perf_tracker.end_tracking()
+    
+    # Final results with detailed metrics
+    if successful_compressions > 0:
+        total_gain = ((total_original_size - total_compressed_size) / total_original_size) * 100
+        total_mb_processed = total_original_size / (1024 * 1024)
+        processing_speed = total_mb_processed / total_duration
+        avg_time_per_file = total_duration / successful_compressions
+        
+        result_text = (
+            f"✅ Completed in {total_duration:.2f} sec\n"
+            f"📁 Files processed: {successful_compressions}/{total_files}\n"
+            f"📄 Total original size: {total_original_size / 1024 / 1024:.2f} MB\n"
+            f"📉 Total compressed size: {total_compressed_size / 1024 / 1024:.2f} MB\n"
+            f"💾 Total space saved: {total_gain:.1f}%\n"
+            f"⚡ Overall speed: {processing_speed:.2f} MB/s\n"
+            f"📊 Average time per file: {avg_time_per_file:.2f}s\n"
+            f"⚙️ Quality: {quality_mode.upper()}\n"
+            f"📁 Output directory: {os.path.basename(output_dir)}\n\n"
+            f"{perf_tracker.get_detailed_report()}"
+        )
+        
+        result_label.config(text=result_text)
+        logger.info(f"✅ Batch compression completed: {output_dir}")
+    else:
+        error_msg = "❌ No files could be compressed successfully."
+        result_label.config(text=error_msg)
+        logger.error(error_msg)
+
+def browse_input():
+    """Browse for input file or directory"""
+    choice = messagebox.askyesnocancel(
+        "Selection Type",
+        "What would you like to select:\n"
+        "• YES = Single PDF file\n"
+        "• NO = Directory containing PDFs\n"
+        "• CANCEL = Cancel"
+    )
+    
+    if choice is True:
+        # Select single PDF file
+        file_path = filedialog.askopenfilename(
+            title="Select PDF File",
+            filetypes=[("PDF Files", "*.pdf"), ("All Files", "*.*")]
+        )
+        if file_path:
+            input_entry.delete(0, tk.END)
+            input_entry.insert(0, file_path)
+    elif choice is False:
+        # Select directory
+        dir_path = filedialog.askdirectory(
+            title="Select Directory Containing PDFs"
+        )
+        if dir_path:
+            input_entry.delete(0, tk.END)
+            input_entry.insert(0, dir_path)
+
+def open_log_file():
+    """Open the log file in the default text editor"""
+    log_file = "pdf_compressor.log"
+    if os.path.exists(log_file):
+        try:
+            if sys.platform == "win32":
+                os.startfile(log_file)
+            elif sys.platform == "darwin":  # macOS
+                subprocess.run(["open", log_file])
+            else:  # Linux
+                subprocess.run(["xdg-open", log_file])
+        except Exception as e:
+            messagebox.showerror("Error", f"Cannot open log file: {e}")
+    else:
+        messagebox.showinfo("Info", "Log file not found.")
+
+def clear_results():
+    """Clear the results display"""
+    result_label.config(text="")
+
+# Enhanced GUI Interface
+root = tk.Tk()
+root.title("🔧 Enhanced PDF B&W Compressor with Advanced Logging")
+root.geometry("900x700")
+root.configure(bg="#f0f8ff")
+
+# Configure styles
+style = ttk.Style()
+style.theme_use("clam")
+style.configure("TButton", font=("Segoe UI", 10), padding=6)
+style.configure("TLabel", font=("Segoe UI", 10), background="#f0f8ff")
+style.configure("Title.TLabel", font=("Segoe UI", 12, "bold"), background="#f0f8ff")
+
+# Main frame
+main_frame = ttk.Frame(root, padding=20)
+main_frame.pack(fill="both", expand=True)
+
+# Title
+title_label = ttk.Label(
+    main_frame,
+    text="🔧 Enhanced PDF B&W Compressor",
+    style="Title.TLabel"
+)
+title_label.grid(row=0, column=0, columnspan=4, pady=(0, 10))
+
+# Instructions
+instructions = ttk.Label(
+    main_frame,
+    text="📝 Advanced PDF compression with comprehensive logging and error handling",
+    font=("Segoe UI", 9, "italic")
+)
+instructions.grid(row=1, column=0, columnspan=4, pady=(0, 15))
+
+# Input selection frame
+input_frame = ttk.LabelFrame(main_frame, text="📥 Input Selection", padding=10)
+input_frame.grid(row=2, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+
+ttk.Label(input_frame, text="File or Directory:").grid(row=0, column=0, sticky="w")
+input_entry = ttk.Entry(input_frame, width=70)
+input_entry.grid(row=1, column=0, columnspan=2, padx=(0, 10), pady=5, sticky="ew")
+ttk.Button(input_frame, text="Browse...", command=browse_input).grid(row=1, column=2)
+
+# Quality selection frame
+quality_frame = ttk.LabelFrame(main_frame, text="⚙️ Quality Settings", padding=10)
+quality_frame.grid(row=3, column=0, columnspan=4, sticky="ew", pady=(0, 10))
+
+quality_var = tk.StringVar(value="balanced")
+ttk.Radiobutton(quality_frame, text="📖 High Quality (300dpi) - Best for archival", 
+                variable=quality_var, value="high").grid(row=0, column=0, sticky="w")
+ttk.Radiobutton(quality_frame, text="⚖️ Balanced (200dpi) - Recommended for most uses", 
+                variable=quality_var, value="balanced").grid(row=1, column=0, sticky="w")
+ttk.Radiobutton(quality_frame, text="📦 Compact (150dpi) - Smallest file size", 
+                variable=quality_var, value="compact").grid(row=2, column=0, sticky="w")
+
+# Control buttons frame
+control_frame = ttk.Frame(main_frame)
+control_frame.grid(row=4, column=0, columnspan=4, pady=15)
+
+ttk.Button(control_frame, text="🚀 Start Compression", command=compress_pdf).grid(row=0, column=0, padx=5)
+ttk.Button(control_frame, text="📄 View Log", command=open_log_file).grid(row=0, column=1, padx=5)
+ttk.Button(control_frame, text="🧹 Clear Results", command=clear_results).grid(row=0, column=2, padx=5)
+
+# Results frame
+results_frame = ttk.LabelFrame(main_frame, text="📊 Results & Progress", padding=10)
+results_frame.grid(row=5, column=0, columnspan=4, sticky="nsew", pady=(0, 10))
+
+# Configure scrollable text widget
+result_text = tk.Text(results_frame, height=20, width=90, font=("Consolas", 9), wrap=tk.WORD)
+scrollbar = ttk.Scrollbar(results_frame, orient="vertical", command=result_text.yview)
+result_text.configure(yscrollcommand=scrollbar.set)
+
+result_text.grid(row=0, column=0, sticky="nsew")
+scrollbar.grid(row=0, column=1, sticky="ns")
+
+# Configure grid weights
+main_frame.grid_rowconfigure(5, weight=1)
+main_frame.grid_columnconfigure(0, weight=1)
+results_frame.grid_rowconfigure(0, weight=1)
+results_frame.grid_columnconfigure(0, weight=1)
+input_frame.grid_columnconfigure(0, weight=1)
+
+# Create a label-like interface for the text widget
+class ResultLabel:
+    def __init__(self, text_widget):
+        self.text_widget = text_widget
+    
+    def config(self, text=""):
+        self.text_widget.delete(1.0, tk.END)
+        self.text_widget.insert(1.0, text)
+        self.text_widget.see(tk.END)
+
+result_label = ResultLabel(result_text)
+
+# Footer info
+footer_frame = ttk.Frame(main_frame)
+footer_frame.grid(row=6, column=0, columnspan=4, pady=(10, 0))
+
+info_text = (
+    "💡 Enhanced Features: Advanced logging • Robust error handling • Temp file safety • "
+    "Progress tracking • Performance metrics • CLI support"
+)
+info_label = ttk.Label(footer_frame, text=info_text, font=("Segoe UI", 8), justify="center")
+info_label.pack()
+
+def main_cli():
+    """Enhanced CLI mode with better error handling"""
+    
+    if len(sys.argv) < 2:
+        print("❌ Please provide a PDF file or directory path.")
+        print("Usage: python script.py <path> [quality]")
+        print("Quality options: high | balanced | compact (default: balanced)")
+        print("\nExamples:")
+        print("  python script.py document.pdf")
+        print("  python script.py /path/to/pdfs/ balanced")
+        print("  python script.py document.pdf high")
+        return
+
+    input_path = sys.argv[1]
+    quality_mode = sys.argv[2] if len(sys.argv) > 2 else "balanced"
+    
+    # Validate quality mode
+    if quality_mode not in ["high", "balanced", "compact"]:
+        print(f"❌ Invalid quality mode: {quality_mode}")
+        print("Valid options: high | balanced | compact")
+        return
+
+    if not os.path.exists(input_path):
+        print(f"❌ Path not found: {input_path}")
+        return
+
+    # Check if Ghostscript is available
+    try:
+        result = subprocess.run(["gswin64c", "-version"], capture_output=True, check=True)
+        gs_version = result.stdout.decode().strip().split('\n')[0]
+        print(f"✅ Ghostscript found: {gs_version}")
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        print("❌ Ghostscript not found. Please install Ghostscript first.")
+        print("Download from: https://www.ghostscript.com/download/gsdnld.html")
+        return
+
+    print(f"🔧 Starting PDF compression...")
+    print(f"📁 Input: {input_path}")
+    print(f"⚙️ Quality: {quality_mode}")
+    print(f"📝 Log file: pdf_compressor.log")
+    print("-" * 50)
+
+    if os.path.isfile(input_path):
+        # Single PDF file
+        perf_tracker.start_tracking("Single File Compression (CLI)")
+        compress_single_file_cli(input_path, quality_mode)
+    elif os.path.isdir(input_path):
+        # Directory with PDFs
+        perf_tracker.start_tracking("Batch Compression (CLI)")
+        compress_directory_cli(input_path, quality_mode)
+    else:
+        print("❌ Unsupported path type (neither file nor directory).")
+
+def compress_single_file_cli(input_file, quality_mode):
+    """Compress a single PDF file (CLI version)"""
+    perf_tracker.track_phase("File Processing")
+    
+    base_name = os.path.splitext(input_file)[0]
+    output_file = f"{base_name}_optimized_bw.pdf"
+    
+    print(f"🔄 Processing: {os.path.basename(input_file)}")
+    
+    success, message = compress_single_pdf(input_file, output_file, quality_mode)
+    
+    perf_tracker.track_phase("Finalizing")
+    total_duration = perf_tracker.end_tracking()
+    
+    if success:
+        original_size = os.path.getsize(input_file)
+        compressed_size = os.path.getsize(output_file)
+        gain = ((original_size - compressed_size) / original_size) * 100
+        processing_speed = original_size / (1024 * 1024) / total_duration
+        
+        print(f"\n✅ Compression completed successfully!")
+        print(f"📄 Original size: {original_size / 1024 / 1024:.2f} MB")
+        print(f"📉 Compressed size: {compressed_size / 1024 / 1024:.2f} MB")
+        print(f"💾 Space saved: {gain:.1f}%")
+        print(f"⚡ Processing speed: {processing_speed:.2f} MB/s")
+        print(f"📁 Output file: {output_file}")
+        print(f"\n{perf_tracker.get_detailed_report()}")
+    else:
+        print(f"\n❌ Compression failed: {message}")
+        print("📝 Check the log file for detailed error information.")
+
+def compress_directory_cli(input_dir, quality_mode):
+    """Compress all PDF files in a directory (CLI version)"""
+    perf_tracker.track_phase("Directory Scanning")
+    
+    # Find all PDF files in the directory
+    pdf_files = glob.glob(os.path.join(input_dir, "*.pdf"))
+    
+    if not pdf_files:
+        print("❌ No PDF files found in the directory.")
+        return
+    
+    print(f"📁 Found {len(pdf_files)} PDF files to process")
+    
+    perf_tracker.track_phase("Directory Creation")
+    
+    # Create output directory
+    output_dir = f"{input_dir}_optimized_bw"
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        print(f"📁 Created output directory: {output_dir}")
+    except Exception as e:
+        print(f"❌ Failed to create output directory: {e}")
+        return
+    
+    perf_tracker.track_phase("Batch Processing")
+    
+    total_files = len(pdf_files)
+    successful_compressions = 0
+    total_original_size = 0
+    total_compressed_size = 0
+    
+    print(f"\n🔄 Processing {total_files} files...")
+    print("-" * 50)
+    
+    for i, pdf_file in enumerate(pdf_files, 1):
+        # Progress indicator
+        elapsed = time.time() - perf_tracker.start_time
+        avg_time_per_file = elapsed / i if i > 0 else 0
+        estimated_remaining = avg_time_per_file * (total_files - i)
+        
+        print(f"📄 [{i}/{total_files}] {os.path.basename(pdf_file)}")
+        print(f"⏱️  Elapsed: {elapsed:.1f}s | Est. remaining: {estimated_remaining:.1f}s")
+        
+        # Create output filename in the new directory
+        filename = os.path.basename(pdf_file)
+        base_name = os.path.splitext(filename)[0]
+        output_file = os.path.join(output_dir, f"{base_name}_optimized_bw.pdf")
+        
+        success, message = compress_single_pdf(pdf_file, output_file, quality_mode)
+        
+        if success:
+            successful_compressions += 1
+            total_original_size += os.path.getsize(pdf_file)
+            total_compressed_size += os.path.getsize(output_file)
+            
+            # Show compression stats for this file
+            original_size = os.path.getsize(pdf_file)
+            compressed_size = os.path.getsize(output_file)
+            gain = ((original_size - compressed_size) / original_size) * 100
+            print(f"✅ Compressed: {gain:.1f}% reduction ({original_size/1024/1024:.2f} → {compressed_size/1024/1024:.2f} MB)")
+        else:
+            print(f"❌ Failed: {message}")
+        
+        print("-" * 50)
+    
+    perf_tracker.track_phase("Finalizing")
+    total_duration = perf_tracker.end_tracking()
+    
+    # Final results
+    print(f"\n📊 BATCH COMPRESSION RESULTS")
+    print("=" * 50)
+    
+    if successful_compressions > 0:
+        total_gain = ((total_original_size - total_compressed_size) / total_original_size) * 100
+        total_mb_processed = total_original_size / (1024 * 1024)
+        processing_speed = total_mb_processed / total_duration
+        avg_time_per_file = total_duration / successful_compressions
+        
+        print(f"✅ Successfully processed: {successful_compressions}/{total_files} files")
+        print(f"⏱️  Total time: {total_duration:.2f} seconds")
+        print(f"📄 Total original size: {total_original_size / 1024 / 1024:.2f} MB")
+        print(f"📉 Total compressed size: {total_compressed_size / 1024 / 1024:.2f} MB")
+        print(f"💾 Total space saved: {total_gain:.1f}%")
+        print(f"⚡ Overall processing speed: {processing_speed:.2f} MB/s")
+        print(f"📊 Average time per file: {avg_time_per_file:.2f}s")
+        print(f"📁 Output directory: {output_dir}")
+        
+        print(f"\n{perf_tracker.get_detailed_report()}")
+    else:
+        print("❌ No files were successfully compressed.")
+        print("📝 Check the log file for detailed error information.")
+
+def show_help():
+    """Show help information"""
+    help_text = """
+🔧 Enhanced PDF B&W Compressor Help
+
+DESCRIPTION:
+    This tool compresses PDF files to black & white with optimized settings
+    for scanned documents. It provides comprehensive logging and error handling.
+
+USAGE:
+    GUI Mode:    python script.py
+    CLI Mode:    python script.py <path> [quality]
+
+ARGUMENTS:
+    path        Path to PDF file or directory containing PDFs
+    quality     Compression quality: high | balanced | compact (default: balanced)
+
+QUALITY MODES:
+    high        300dpi, 85% JPEG quality - Best for archival
+    balanced    200dpi, 70% JPEG quality - Recommended for most uses  
+    compact     150dpi, 60% JPEG quality - Smallest file size
+
+EXAMPLES:
+    python script.py document.pdf
+    python script.py /path/to/pdfs/ balanced
+    python script.py document.pdf high
+
+REQUIREMENTS:
+    - Python 3.6+
+    - Ghostscript (gswin64c must be in PATH)
+    - tkinter (for GUI mode)
+
+LOGGING:
+    All operations are logged to 'pdf_compressor.log' in the current directory.
+    Use the 'View Log' button in GUI mode or check the file directly.
+
+OUTPUT:
+    - Single file: Creates <filename>_optimized_bw.pdf in same directory
+    - Directory: Creates <dirname>_optimized_bw/ with all processed files
+    """
+    print(help_text)
 
 if __name__ == "__main__":
-    main()
+    # Add help option
+    if len(sys.argv) > 1 and sys.argv[1] in ["-h", "--help", "help"]:
+        show_help()
+    elif len(sys.argv) > 1:
+        # CLI mode
+        main_cli()
+    else:
+        # GUI mode
+        try:
+            print("🔧 Starting Enhanced PDF B&W Compressor...")
+            print("📝 Log file: pdf_compressor.log")
+            print("🖥️  GUI Mode - Opening interface...")
+            root.mainloop()
+        except Exception as e:
+            print(f"❌ Failed to start GUI: {e}")
+            print("📝 Try running in CLI mode: python script.py <path> [quality]")
+            logger.error(f"GUI startup failed: {e}")
